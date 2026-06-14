@@ -331,8 +331,8 @@ class FanArtGuard(_PluginBase):
         if self._enabled and self._enable_cron and self._cron:
             from apscheduler.triggers.cron import CronTrigger
             return [{
-                "id": "FanArtGuard",
-                "name": "FanArt全量扫描",
+                "id": "FanArtGuard.FullScan",
+                "name": "FanArt全量扫描定时服务",
                 "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self._scan_all,
                 "kwargs": {}
@@ -347,13 +347,17 @@ class FanArtGuard(_PluginBase):
                 "path": "/scan",
                 "endpoint": self._api_scan,
                 "methods": ["GET"],
+                "auth": "bear",
                 "summary": "手动触发扫描",
+                "description": "指定目录扫描或全量扫描媒体库",
             },
             {
                 "path": "/status",
                 "endpoint": self._api_status,
                 "methods": ["GET"],
+                "auth": "bear",
                 "summary": "插件状态",
+                "description": "返回插件运行状态信息",
             },
         ]
 
