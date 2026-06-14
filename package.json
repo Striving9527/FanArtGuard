@@ -1,0 +1,12 @@
+{
+    "FanArt守护者": {
+        "id": "FanArtGuard",
+        "name": "FanArt守护者",
+        "description": "自动补充媒体文件夹中缺失的fanart、background、backdrop、thumb图片",
+        "version": "1.0",
+        "author": "yourname",
+        "level": 1,
+        "icon": "",
+        "history": {}
+    }
+}
