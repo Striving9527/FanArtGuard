@@ -3,317 +3,411 @@ import shutil
 from pathlib import Path
 from typing import Any, List, Dict, Tuple, Optional
 
-from app.core.event import EventManager, Event
+from app.core.event import eventmanager, Event
 from app.plugins import _PluginBase
 from app.schemas.types import EventType
 from app.schemas import NotificationType
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
+from app.log import logger
 
 
 class FanArtGuard(_PluginBase):
-    """FanArt守护者 —— 自动补充媒体文件夹中缺失的fanart/background/backdrop/thumb图片"""
-
+    # ─── 插件元数据 ───────────────────────────────────────────
     plugin_name = "FanArt守护者"
     plugin_desc = "自动补充媒体文件夹中缺失的fanart、background、backdrop、thumb图片"
+    plugin_icon = "fanart.png"
     plugin_version = "1.0"
-    plugin_author = "yourname"
-    plugin_config_fields = [
-        {
-            "key": "enable_auto",
-            "type": "switch",
-            "defaultValue": True,
-            "label": "启用自动触发",
-            "help": "监听文件转移事件，自动检查并补充缺失图片",
-        },
-        {
-            "key": "enable_cron",
-            "type": "switch",
-            "defaultValue": False,
-            "label": "启用定时全量扫描",
-            "help": "按Cron表达式定时扫描整个媒体库，补充所有缺失图片",
-        },
-        {
-            "key": "cron_expression",
-            "type": "text",
-            "defaultValue": "0 3 * * *",
-            "label": "Cron表达式",
-            "help": "定时全量扫描的Cron表达式，默认每天凌晨3点执行",
-        },
-        {
-            "key": "media_root",
-            "type": "text",
-            "defaultValue": "",
-            "label": "媒体库根目录",
-            "help": "全量扫描时的媒体库根目录（留空则自动使用系统设置）",
-        },
-        {
-            "key": "extensions",
-            "type": "text",
-            "defaultValue": "jpg,jpeg,png,webp",
-            "label": "图片扩展名",
-            "help": "支持的图片文件扩展名，逗号分隔",
-        },
-        {
-            "key": "image_types",
-            "type": "text",
-            "defaultValue": "fanart,background,backdrop,thumb",
-            "label": "图片类型",
-            "help": "需要检查的图片类型，优先级从高到低排列（fanart > background > backdrop > thumb）",
-        },
-        {
-            "key": "notify_on_copy",
-            "type": "switch",
-            "defaultValue": False,
-            "label": "操作通知",
-            "help": "补充图片后发送系统通知",
-        },
-    ]
+    plugin_author = "Striving9527"
+    author_url = "https://github.com/Striving9527/FanArtGuard"
+    plugin_config_prefix = "fanartguard_"
+    plugin_order = 28
+    auth_level = 1
 
-    # 后台定时器实例
-    _scheduler: Optional[BackgroundScheduler] = None
-    # 缓存的配置
-    _config: dict = {}
-    # event_manager 引用（由 _PluginBase 或本插件维护）
-    event_manager: Optional[EventManager] = None
-
-    # ─── 生命周期 ──────────────────────────────────────────────
+    # ─── 私有属性 ────────────────────────────────────────────
+    _enabled = False
+    _enable_auto = True
+    _enable_cron = False
+    _cron = ""
+    _extensions = "jpg,jpeg,png,webp"
+    _image_types = "fanart,background,backdrop,thumb"
+    _notify = False
+    _onlyonce = False
 
     def init_plugin(self, config: dict = None):
-        """插件初始化：读取配置 → 注册事件监听 → 启动定时任务"""
-        self._config = config or {}
-        self._refresh_config()
+        if config:
+            self._enabled = config.get("enabled", False)
+            self._enable_auto = config.get("enable_auto", True)
+            self._enable_cron = config.get("enable_cron", False)
+            self._cron = config.get("cron") or ""
+            self._extensions = config.get("extensions") or "jpg,jpeg,png,webp"
+            self._image_types = config.get("image_types") or "fanart,background,backdrop,thumb"
+            self._notify = config.get("notify", False)
+            self._onlyonce = config.get("onlyonce", False)
 
-        # 获取 / 创建 EventManager
-        if self.event_manager is None:
-            self.event_manager = EventManager()
+        if not self._enabled:
+            return
 
         # 注册事件监听
-        if self._config.get("enable_auto", True):
-            self.event_manager.add_event_listener(
+        if self._enable_auto:
+            eventmanager.add_event_listener(
                 EventType.TransferComplete, self.on_transfer_complete
             )
-            self.info("已注册 TransferComplete 事件监听")
+            logger.info("[FanArt] 已注册 TransferComplete 事件监听")
 
-        # 启动定时任务
-        self._start_scheduler()
-        self.info(f"FanArt守护者 v{self.plugin_version} 已启动")
+        # 立即运行一次
+        if self._onlyonce:
+            logger.info("[FanArt] 立即运行一次全量扫描")
+            self._scan_all()
+            self._onlyonce = False
+            self.__update_config()
 
-    def stop(self):
-        """插件卸载时清理资源"""
-        self._stop_scheduler()
-        if self.event_manager:
-            self.event_manager.remove_event_listener(
-                EventType.TransferComplete, self.on_transfer_complete
-            )
-        self.info("FanArt守护者已停止")
+        logger.info(f"[FanArt] v{self.plugin_version} 已启动")
 
-    def get_state(self) -> bool:
-        return True
+    # ─── 事件处理 ─────────────────────────────────────────────
 
-    # ─── 事件处理 ──────────────────────────────────────────────
-
-    def on_transfer_complete(self, event: Event):
-        """
-        文件转移完成事件 —— 这是主要智能触发入口。
-        MoviePilot整理完媒体文件后会触发此事件，我们只处理命中的那个目录。
-        """
-        if not self._config.get("enable_auto", True):
+    def on_transfer_complete(self, event: Event = None):
+        if not self._enabled or not self._enable_auto:
             return
-
-        event_data = event.event_data or {}
-        target_path = event_data.get("target_path")
+        target_path = ""
+        if event and event.event_data:
+            target_path = event.event_data.get("target_path", "")
         if not target_path or not os.path.isdir(target_path):
             return
-
-        self.debug(f"收到 TransferComplete 事件: {target_path}")
+        logger.debug(f"[FanArt] TransferComplete → {target_path}")
         self._process_directory(target_path)
 
-    # ─── API 端点（可在 MoviePilot 中手动调用） ────────────────
-
-    def get_api(self):
-        """注册API端点，供前端或外部调用"""
-        from fastapi import APIRouter
-
-        router = APIRouter(prefix="/FanArtGuard", tags=["FanArt守护者"])
-
-        @router.get("/scan")
-        def api_scan(path: str = ""):
-            """手动触发扫描：可指定路径，留空则全量扫描"""
-            if path and os.path.isdir(path):
-                self._process_directory(path)
-                return {"code": 0, "msg": f"已处理目录: {path}"}
-            elif not path:
-                count = self._scan_all()
-                return {"code": 0, "msg": f"全量扫描完成，处理了 {count} 个目录"}
-            else:
-                return {"code": 1, "msg": f"路径无效: {path}"}
-
-        @router.get("/status")
-        def api_status():
-            """返回插件运行状态"""
-            return {
-                "code": 0,
-                "data": {
-                    "enable_auto": self._config.get("enable_auto", True),
-                    "enable_cron": self._config.get("enable_cron", False),
-                    "cron": self._config.get("cron_expression", ""),
-                    "version": self.plugin_version,
-                },
-            }
-
-        return router
-
-    # ─── 核心逻辑 ──────────────────────────────────────────────
+    # ─── 核心逻辑 ─────────────────────────────────────────────
 
     def _process_directory(self, dir_path: str):
-        """处理单个目录：检查缺失图片并补充"""
-        existing = self._get_existing_images(dir_path)
-        if not existing:
-            return  # 没有任何图片，跳过
+        ext_list = self.__parse_list(self._extensions, ["jpg", "jpeg", "png", "webp"])
+        type_list = self.__parse_list(self._image_types, ["fanart", "background", "backdrop", "thumb"])
+
+        existing = self._get_existing(dir_path, ext_list, type_list)
+        if not existing or len(existing) == len(type_list):
+            return
 
         src_type, src_path = existing[0]
-        if len(existing) == len(self._image_types):
-            return  # 所有类型已齐全
-
         src_ext = src_path.rsplit(".", 1)[-1].lower()
-        copied_count = 0
+        copied = 0
 
-        for img_type in self._image_types:
-            if self._find_image(dir_path, img_type):
+        for img_type in type_list:
+            if self._find_image(dir_path, img_type, ext_list):
                 continue
-            dst_path = os.path.join(dir_path, f"{img_type}.{src_ext}")
+            dst = os.path.join(dir_path, f"{img_type}.{src_ext}")
             try:
-                shutil.copy(src_path, dst_path)
-                copied_count += 1
-                self.info(f"✔ {os.path.basename(dir_path)}: {src_type}.{src_ext} → {img_type}.{src_ext}")
+                shutil.copy(src_path, dst)
+                copied += 1
+                logger.info(f"[FanArt] ✔ {os.path.basename(dir_path)}: {src_type}.{src_ext} → {img_type}.{src_ext}")
             except OSError as err:
-                self.error(f"✘ 补充 {img_type} 失败: {err}")
+                logger.error(f"[FanArt] ✘ 补充 {img_type} 失败: {err}")
 
-        if copied_count and self._config.get("notify_on_copy"):
-            self._send_notification(
-                f"FanArt守护者 为 {os.path.basename(dir_path)} 补充了 {copied_count} 张图片"
+        if copied and self._notify:
+            self.post_message(
+                mtype=NotificationType.Media整理,
+                title="FanArt守护者",
+                text=f"为 {os.path.basename(dir_path)} 补充了 {copied} 张图片",
             )
 
-    def _scan_all(self) -> int:
-        """全量扫描媒体库根目录"""
-        media_root = self._config.get("media_root") or self._get_default_media_root()
+    def _scan_all(self):
+        media_root = getattr(self, "_media_root", "") or self._get_media_root()
         if not media_root or not os.path.isdir(media_root):
-            self.warn("未配置媒体库根目录或目录不存在")
-            return 0
-
+            logger.warn("[FanArt] 未配置媒体库根目录或目录不存在，跳过全量扫描")
+            return
         count = 0
         for root, dirs, _ in os.walk(media_root):
-            # 跳过隐藏目录和系统目录
             dirs[:] = [d for d in dirs if not d.startswith(".")]
-            # 只处理包含视频文件的目录（更精准的判断）
-            if self._is_media_directory(root):
+            if self._is_media_dir(root):
                 self._process_directory(root)
                 count += 1
+        logger.info(f"[FanArt] 全量扫描完成，处理 {count} 个目录")
 
-        self.info(f"全量扫描完成，共处理 {count} 个媒体目录")
-        return count
-
-    def _find_image(self, dir_path: str, image_type: str) -> Optional[str]:
-        """在目录中查找指定类型的图片"""
-        for ext in self._extensions:
-            img_path = os.path.join(dir_path, f"{image_type}.{ext}")
-            if os.path.isfile(img_path):
-                return img_path
-        return None
-
-    def _get_existing_images(self, dir_path: str) -> List[Tuple[str, str]]:
-        """收集目录中已存在的图片，返回 [(类型, 路径), ...]"""
-        existing = []
-        for img_type in self._image_types:
-            img_path = self._find_image(dir_path, img_type)
-            if img_path:
-                existing.append((img_type, img_path))
-        return existing
+    # ─── 辅助方法 ─────────────────────────────────────────────
 
     @staticmethod
-    def _is_media_directory(dir_path: str) -> bool:
-        """判断是否为媒体目录（检查是否包含视频/字幕/媒体信息文件）"""
-        media_exts = {".mp4", ".mkv", ".avi", ".ts", ".mov", ".wmv",
-                      ".flv", ".m2ts", ".iso", ".nfo", ".srt", ".ass", ".ssa"}
+    def __parse_list(raw: str, fallback: List[str]) -> List[str]:
+        result = [s.strip().lstrip(".") for s in raw.split(",") if s.strip()]
+        return result or fallback
+
+    @staticmethod
+    def _find_image(dir_path: str, img_type: str, ext_list: List[str]) -> Optional[str]:
+        for ext in ext_list:
+            p = os.path.join(dir_path, f"{img_type}.{ext}")
+            if os.path.isfile(p):
+                return p
+        return None
+
+    @staticmethod
+    def _get_existing(dir_path: str, ext_list: List[str], type_list: List[str]) -> List[Tuple[str, str]]:
+        result = []
+        for t in type_list:
+            p = FanArtGuard._find_image(dir_path, t, ext_list)
+            if p:
+                result.append((t, p))
+        return result
+
+    @staticmethod
+    def _is_media_dir(dir_path: str) -> bool:
+        suffixes = {".mp4", ".mkv", ".avi", ".ts", ".mov", ".wmv",
+                    ".flv", ".m2ts", ".iso", ".nfo", ".srt", ".ass", ".ssa"}
         try:
             for f in os.listdir(dir_path):
-                if os.path.splitext(f)[1].lower() in media_exts:
+                if os.path.splitext(f)[1].lower() in suffixes:
                     return True
         except OSError:
             pass
         return False
 
-    # ─── 定时任务 ──────────────────────────────────────────────
-
-    def _start_scheduler(self):
-        if not self._config.get("enable_cron") or not self._config.get("cron_expression"):
-            return
-        try:
-            self._scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
-            self._scheduler.add_job(
-                self._scan_all,
-                CronTrigger.from_crontab(self._config["cron_expression"]),
-                id="fanart_guard_cron",
-                name="FanArt全量扫描",
-                replace_existing=True,
-            )
-            self._scheduler.start()
-            self.info(f"定时任务已启动: {self._config['cron_expression']}")
-        except Exception as e:
-            self.error(f"启动定时任务失败: {e}")
-
-    def _stop_scheduler(self):
-        if self._scheduler and self._scheduler.running:
-            self._scheduler.shutdown(wait=False)
-            self._scheduler = None
-
-    # ─── 配置 & 辅助 ───────────────────────────────────────────
-
-    def _refresh_config(self):
-        """将配置项解析为实例属性"""
-        self._extensions = [
-            e.strip().lstrip(".")
-            for e in self._config.get("extensions", "jpg,jpeg,png,webp").split(",")
-            if e.strip()
-        ] or ["jpg", "jpeg", "png", "webp"]
-        self._image_types = [
-            t.strip().lower()
-            for t in self._config.get("image_types", "fanart,background,backdrop").split(",")
-            if t.strip()
-        ] or ["fanart", "background", "backdrop", "thumb"]
-
-    def _get_default_media_root(self) -> str:
-        """尝试从系统设置或其他途径获取媒体库根目录"""
-        # MoviePilot 中可以通过系统设置获取
+    def _get_media_root(self) -> str:
         try:
             from app.core.config import settings
             return getattr(settings, "MEDIA_ROOT", "") or getattr(settings, "LIBRARY_PATH", "")
         except ImportError:
             return ""
 
-    def _send_notification(self, text: str):
-        """发送系统通知"""
+    # ─── 配置页面 ─────────────────────────────────────────────
+
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        return [
+            {
+                'component': 'VForm',
+                'content': [
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {'model': 'enabled', 'label': '启用插件'}
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {'model': 'enable_auto', 'label': '自动触发（监听文件入库）'}
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {'model': 'notify', 'label': '操作通知'}
+                                    }
+                                ]
+                            },
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {'model': 'enable_cron', 'label': '定时全量扫描'}
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'cron',
+                                            'label': 'Cron 表达式',
+                                            'placeholder': '0 3 * * *'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {'model': 'onlyonce', 'label': '立即运行一次全量扫描'}
+                                    }
+                                ]
+                            },
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'extensions',
+                                            'label': '图片扩展名',
+                                            'placeholder': 'jpg,jpeg,png,webp'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'image_types',
+                                            'label': '图片类型（优先级从高到低）',
+                                            'placeholder': 'fanart,background,backdrop,thumb'
+                                        }
+                                    }
+                                ]
+                            },
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'text': '自动触发：监听 MoviePilot TransferComplete 事件，即时处理新入库媒体。\n'
+                                                    '定时扫描：按 Cron 定期全量扫描，兜底补充遗漏。\n'
+                                                    '优先级：fanart > background > backdrop > thumb。'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                ]
+            }
+        ], {
+            "enabled": False,
+            "enable_auto": True,
+            "enable_cron": False,
+            "cron": "0 3 * * *",
+            "extensions": "jpg,jpeg,png,webp",
+            "image_types": "fanart,background,backdrop,thumb",
+            "notify": False,
+            "onlyonce": False,
+        }
+
+    def get_page(self) -> List[dict]:
+        return [
+            {
+                'component': 'VAlert',
+                'props': {
+                    'type': 'info',
+                    'variant': 'tonal',
+                    'text': 'FanArt守护者 v1.0 已就绪。\n'
+                            '自动监听 TransferComplete 事件，即时补充缺失图片。\n'
+                            '支持：fanart > background > backdrop > thumb。'
+                }
+            }
+        ]
+
+    # ─── 定时服务 ─────────────────────────────────────────────
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        if self._enabled and self._enable_cron and self._cron:
+            from apscheduler.triggers.cron import CronTrigger
+            return [{
+                "id": "FanArtGuard",
+                "name": "FanArt全量扫描",
+                "trigger": CronTrigger.from_crontab(self._cron),
+                "func": self._scan_all,
+                "kwargs": {}
+            }]
+        return []
+
+    # ─── API 端点 ─────────────────────────────────────────────
+
+    def get_api(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "path": "/scan",
+                "endpoint": self._api_scan,
+                "methods": ["GET"],
+                "summary": "手动触发扫描",
+            },
+            {
+                "path": "/status",
+                "endpoint": self._api_status,
+                "methods": ["GET"],
+                "summary": "插件状态",
+            },
+        ]
+
+    def _api_scan(self, path: str = ""):
+        import json
+        from fastapi.responses import Response
+        if path and os.path.isdir(path):
+            self._process_directory(path)
+            return Response(content=json.dumps({"code": 0, "msg": f"已处理: {path}"}), media_type="application/json")
+        elif not path:
+            self._scan_all()
+            return Response(content=json.dumps({"code": 0, "msg": "全量扫描已启动"}), media_type="application/json")
+        else:
+            return Response(content=json.dumps({"code": 1, "msg": f"路径无效: {path}"}), media_type="application/json")
+
+    def _api_status(self):
+        import json
+        from fastapi.responses import Response
+        return Response(content=json.dumps({
+            "enabled": self._enabled,
+            "enable_auto": self._enable_auto,
+            "enable_cron": self._enable_cron,
+            "cron": self._cron,
+            "version": self.plugin_version,
+        }), media_type="application/json")
+
+    # ─── 生命周期 ─────────────────────────────────────────────
+
+    def get_state(self) -> bool:
+        return self._enabled
+
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
+        return []
+
+    def stop_service(self):
         try:
-            from app.chain.notification import NotificationChain
-            NotificationChain().post(
-                title="FanArt守护者",
-                text=text,
-                mtype=NotificationType.Media整理,
+            eventmanager.remove_event_listener(
+                EventType.TransferComplete, self.on_transfer_complete
             )
         except Exception:
-            self.info(f"[通知] {text}")
+            pass
+        logger.info("[FanArt] 已停止")
 
-    # ─── 日志快捷方法 ──────────────────────────────────────────
+    # ─── 内部方法 ─────────────────────────────────────────────
 
-    def info(self, msg: str):
-        super().info(f"[FanArt] {msg}")
-
-    def warn(self, msg: str):
-        super().warn(f"[FanArt] {msg}")
-
-    def error(self, msg: str):
-        super().error(f"[FanArt] {msg}")
-
-    def debug(self, msg: str):
-        super().debug(f"[FanArt] {msg}")
+    def __update_config(self):
+        self.update_config({
+            "enabled": self._enabled,
+            "enable_auto": self._enable_auto,
+            "enable_cron": self._enable_cron,
+            "cron": self._cron,
+            "extensions": self._extensions,
+            "image_types": self._image_types,
+            "notify": self._notify,
+            "onlyonce": self._onlyonce,
+        })
