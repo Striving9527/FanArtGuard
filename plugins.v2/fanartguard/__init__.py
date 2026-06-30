@@ -15,7 +15,7 @@ class FanArtGuard(_PluginBase):
     plugin_name = "FanArt守护者"
     plugin_desc = "自动补充媒体文件夹中缺失的fanart、background、backdrop、thumb图片"
     plugin_icon = "fanart.png"
-    plugin_version = "1.0"
+    plugin_version = "2.0"
     plugin_author = "Striving9527"
     author_url = "https://github.com/Striving9527/FanArtGuard"
     plugin_config_prefix = "fanartguard_"

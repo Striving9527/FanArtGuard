@@ -3,12 +3,13 @@
         "name": "FanArt守护者",
         "description": "自动补充媒体文件夹中缺失的fanart、background、backdrop、thumb图片",
         "labels": "媒体整理",
-        "version": "1.0",
+        "version": "2.0",
         "icon": "fanart.png",
         "author": "Striving9527",
         "level": 1,
         "release": true,
         "history": {
+            "v2.0": "完全对齐V2插件规范：迁移至plugins.v2/目录，使用package.v2.json索引，完善get_form/get_service/get_api/get_page方法，通知改用MediaServer类型及【】标题格式",
             "v1.0": "初始版本：监听TransferComplete事件，自动补充fanart/background/backdrop/thumb图片，支持定时全量扫描"
         }
     }
