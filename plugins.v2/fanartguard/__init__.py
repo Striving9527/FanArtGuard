@@ -15,7 +15,7 @@ class FanArtGuard(_PluginBase):
     plugin_name = "FanArt守护者"
     plugin_desc = "自动补充媒体文件夹中缺失的fanart、background、backdrop、thumb图片"
     plugin_icon = "fanart.png"
-    plugin_version = "2.0"
+    plugin_version = "2.1"
     plugin_author = "Striving9527"
     author_url = "https://github.com/Striving9527/FanArtGuard"
     plugin_config_prefix = "fanartguard_"
@@ -30,14 +30,21 @@ class FanArtGuard(_PluginBase):
     _extensions = "jpg,jpeg,png,webp"
     _image_types = "fanart,background,backdrop,thumb"
     _notify = False
+    _scan_paths = ""
+    _exclude_paths = ""
     _onlyonce = False
 
     def init_plugin(self, config: dict = None):
+        # 先清理旧状态
+        self.stop_service()
+
         if config:
             self._enabled = config.get("enabled", False)
             self._enable_auto = config.get("enable_auto", True)
             self._enable_cron = config.get("enable_cron", False)
             self._cron = config.get("cron") or ""
+            self._scan_paths = config.get("scan_paths") or ""
+            self._exclude_paths = config.get("exclude_paths") or ""
             self._extensions = config.get("extensions") or "jpg,jpeg,png,webp"
             self._image_types = config.get("image_types") or "fanart,background,backdrop,thumb"
             self._notify = config.get("notify", False)
@@ -109,22 +116,36 @@ class FanArtGuard(_PluginBase):
             )
 
     def _scan_all(self):
-        media_root = getattr(self, "_media_root", "") or self._get_media_root()
-        if not media_root or not os.path.isdir(media_root):
-            logger.warn("[FanArt] 未配置媒体库根目录或目录不存在，跳过全量扫描")
+        # 获取扫描路径
+        paths = self.__get_scan_paths()
+        if not paths:
+            logger.warn("[FanArt] 未配置扫描路径且无法获取媒体库根目录，跳过全量扫描")
             return
-        count = 0
-        for root, dirs, _ in os.walk(media_root):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
-            if self._is_media_dir(root):
-                self._process_directory(root)
-                count += 1
-        logger.info(f"[FanArt] 全量扫描完成，处理 {count} 个目录")
+        exclude_paths = [p.strip() for p in self._exclude_paths.split("\n") if p.strip()]
+        total = 0
+
+        for scan_root in paths:
+            if not os.path.isdir(scan_root):
+                logger.warn(f"[FanArt] 扫描路径不存在：{scan_root}")
+                continue
+            logger.info(f"[FanArt] 开始扫描：{scan_root}")
+            count = 0
+            for root, dirs, _ in os.walk(scan_root):
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+                if self.__is_excluded(root, exclude_paths):
+                    continue
+                if self._is_media_dir(root):
+                    self._process_directory(root)
+                    count += 1
+                    total += 1
+            logger.info(f"[FanArt] {scan_root} 扫描完成，处理 {count} 个目录")
+
+        logger.info(f"[FanArt] 全量扫描完成，共处理 {total} 个目录")
         if self._notify:
             self.post_message(
                 mtype=NotificationType.MediaServer,
                 title="【FanArt守护者】全量扫描完成",
-                text=f"共扫描 {count} 个媒体目录，缺失图片已补充",
+                text=f"共扫描 {total} 个媒体目录，缺失图片已补充",
             )
 
     # ─── 辅助方法 ─────────────────────────────────────────────
@@ -162,6 +183,25 @@ class FanArtGuard(_PluginBase):
         except OSError:
             pass
         return False
+
+    @staticmethod
+    def __is_excluded(dir_path: str, exclude_paths: List[str]) -> bool:
+        if not exclude_paths:
+            return False
+        dp = Path(dir_path)
+        for ep in exclude_paths:
+            try:
+                if dp.is_relative_to(Path(ep)):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def __get_scan_paths(self) -> List[str]:
+        if self._scan_paths:
+            return [p.strip() for p in self._scan_paths.split("\n") if p.strip()]
+        media_root = self._get_media_root()
+        return [media_root] if media_root else []
 
     def _get_media_root(self) -> str:
         try:
@@ -259,6 +299,41 @@ class FanArtGuard(_PluginBase):
                                 'props': {'cols': 12, 'md': 6},
                                 'content': [
                                     {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'scan_paths',
+                                            'label': '扫描路径',
+                                            'rows': 3,
+                                            'placeholder': '每一行一个目录，留空则自动使用系统媒体库路径'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'exclude_paths',
+                                            'label': '排除路径',
+                                            'rows': 3,
+                                            'placeholder': '每一行一个目录，扫描时跳过这些路径'
+                                        }
+                                    }
+                                ]
+                            },
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
                                         'component': 'VTextField',
                                         'props': {
                                             'model': 'extensions',
@@ -311,7 +386,9 @@ class FanArtGuard(_PluginBase):
             "enabled": False,
             "enable_auto": True,
             "enable_cron": False,
-            "cron": "0 3 * * *",
+            "cron": "",
+            "scan_paths": "",
+            "exclude_paths": "",
             "extensions": "jpg,jpeg,png,webp",
             "image_types": "fanart,background,backdrop,thumb",
             "notify": False,
@@ -335,12 +412,13 @@ class FanArtGuard(_PluginBase):
     # ─── 定时服务 ─────────────────────────────────────────────
 
     def get_service(self) -> List[Dict[str, Any]]:
-        if self._enabled and self._enable_cron and self._cron:
+        if self._enabled and self._enable_cron:
             from apscheduler.triggers.cron import CronTrigger
+            cron = self._cron or "0 0 */7 * *"
             return [{
                 "id": "FanArtGuard.FullScan",
                 "name": "FanArt全量扫描定时服务",
-                "trigger": CronTrigger.from_crontab(self._cron),
+                "trigger": CronTrigger.from_crontab(cron),
                 "func": self._scan_all,
                 "kwargs": {}
             }]
@@ -417,6 +495,8 @@ class FanArtGuard(_PluginBase):
             "enable_auto": self._enable_auto,
             "enable_cron": self._enable_cron,
             "cron": self._cron,
+            "scan_paths": self._scan_paths,
+            "exclude_paths": self._exclude_paths,
             "extensions": self._extensions,
             "image_types": self._image_types,
             "notify": self._notify,
