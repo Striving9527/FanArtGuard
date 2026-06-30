@@ -15,7 +15,7 @@ class FanArtGuard(_PluginBase):
     plugin_name = "FanArt守护者"
     plugin_desc = "自动补充媒体文件夹中缺失的fanart、background、backdrop、thumb图片"
     plugin_icon = "fanart.png"
-    plugin_version = "2.1"
+    plugin_version = "2.2"
     plugin_author = "Striving9527"
     author_url = "https://github.com/Striving9527/FanArtGuard"
     plugin_config_prefix = "fanartguard_"
@@ -103,7 +103,7 @@ class FanArtGuard(_PluginBase):
             try:
                 shutil.copy(src_path, dst)
                 copied_list.append(img_type)
-                logger.info(f"[FanArt] ✔ {os.path.basename(dir_path)}: {src_type}.{src_ext} → {img_type}.{src_ext}")
+                logger.info(f"[FanArt] ✔ {dir_path}: {src_type}.{src_ext} → {img_type}.{src_ext}")
             except OSError as err:
                 logger.error(f"[FanArt] ✘ 补充 {img_type} 失败: {err}")
 
