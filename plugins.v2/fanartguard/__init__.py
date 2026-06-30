@@ -87,7 +87,7 @@ class FanArtGuard(_PluginBase):
 
         src_type, src_path = existing[0]
         src_ext = src_path.rsplit(".", 1)[-1].lower()
-        copied = 0
+        copied_list = []
 
         for img_type in type_list:
             if self._find_image(dir_path, img_type, ext_list):
@@ -95,16 +95,17 @@ class FanArtGuard(_PluginBase):
             dst = os.path.join(dir_path, f"{img_type}.{src_ext}")
             try:
                 shutil.copy(src_path, dst)
-                copied += 1
+                copied_list.append(img_type)
                 logger.info(f"[FanArt] ✔ {os.path.basename(dir_path)}: {src_type}.{src_ext} → {img_type}.{src_ext}")
             except OSError as err:
                 logger.error(f"[FanArt] ✘ 补充 {img_type} 失败: {err}")
 
-        if copied and self._notify:
+        if copied_list and self._notify:
             self.post_message(
-                mtype=NotificationType.Media整理,
-                title="FanArt守护者",
-                text=f"为 {os.path.basename(dir_path)} 补充了 {copied} 张图片",
+                mtype=NotificationType.MediaServer,
+                title="【FanArt守护者】",
+                text=f"目录：{os.path.basename(dir_path)}\n"
+                     f"已从 {src_type}.{src_ext} 补充：{', '.join(copied_list)}",
             )
 
     def _scan_all(self):
@@ -119,6 +120,12 @@ class FanArtGuard(_PluginBase):
                 self._process_directory(root)
                 count += 1
         logger.info(f"[FanArt] 全量扫描完成，处理 {count} 个目录")
+        if self._notify:
+            self.post_message(
+                mtype=NotificationType.MediaServer,
+                title="【FanArt守护者】全量扫描完成",
+                text=f"共扫描 {count} 个媒体目录，缺失图片已补充",
+            )
 
     # ─── 辅助方法 ─────────────────────────────────────────────
 
