@@ -7,7 +7,7 @@
         "icon": "fanart.png",
         "author": "Striving9527",
         "level": 1,
-        "v2": true,
+        "release": true,
         "history": {
             "v1.0": "初始版本：监听TransferComplete事件，自动补充fanart/background/backdrop/thumb图片，支持定时全量扫描"
         }
